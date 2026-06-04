@@ -11,6 +11,7 @@ jobs:
     runs-on: windows-latest
 
     strategy:
+      fail-fast: false
       matrix:
         configuration: [Release, Debug]
         platform: [x64, ARM64]
@@ -23,7 +24,11 @@ jobs:
       uses: microsoft/setup-msbuild@v2
 
     - name: Setup Windows Driver Kit (WDK)
-      uses: microsoft/setup-wdk@v1
+      run: |
+        Write-Host "Installing WDK via winget..."
+        winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --silent --accept-package-agreements --accept-source-agreements
+        Write-Host "WDK Installation completed."
+      shell: pwsh
 
     - name: Restore NuGet packages
       run: nuget restore AppSandbox.sln
