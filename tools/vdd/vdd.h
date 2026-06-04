@@ -225,10 +225,6 @@ typedef struct _VDD_DEVICE_CONTEXT {
     ID3D11DeviceContext* pCachedCtx;
     LUID                cachedDeviceLuid;
 
-    /* Monitor mode list */
-    DISPLAYCONFIG_VIDEO_SIGNAL_INFO modes[2]; /* 1920x1080@60 (monitor + target) */
-    UINT                modeCount;
-
     /* Recovery: if no AssignSwapChain arrives within 5s of Unassign,
        depart and re-arrive the monitor to force DWM re-engagement.
        Uses a WDF timer so the callback runs on a proper WDF thread

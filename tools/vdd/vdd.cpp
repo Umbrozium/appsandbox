@@ -932,10 +932,6 @@ static void VddContextInit(VDD_DEVICE_CONTEXT* ctx, WDFDEVICE device)
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->wdfDevice = device;
-
-    /* Pre-populate the single 1920x1080@60Hz mode */
-    VddCreateMonitorMode(&ctx->modes[0], 0);  /* vSyncDivider=0 for monitor modes */
-    ctx->modeCount = 1;
 }
 
 static void VddContextCleanup(VDD_DEVICE_CONTEXT* ctx)
