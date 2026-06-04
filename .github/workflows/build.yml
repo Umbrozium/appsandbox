@@ -34,7 +34,9 @@ jobs:
       run: nuget restore AppSandbox.sln
 
     - name: Build the solution
-      run: msbuild AppSandbox.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=${{ matrix.platform }} /m
+      run: |
+        $env:PSModulePath = ""
+        msbuild AppSandbox.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=${{ matrix.platform }} /m
 
     - name: Package Release Structure
       run: |
