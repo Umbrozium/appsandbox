@@ -103,23 +103,23 @@ static const BYTE* VddGetEdid()
 /*  Monitor mode helper                                                      */
 /* ========================================================================= */
 
-static void VddCreateMonitorMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* sig, UINT vSyncDivider)
+static void VddCreateMonitorMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* sig, UINT width, UINT height, UINT refreshNum, UINT refreshDenom, UINT vSyncDivider)
 {
     /* totalSize == activeSize, pixelRate = refresh * w * h.
        IddCx validates these relationships; using actual blanking values causes
        STATUS_INVALID_PARAMETER from IddCxMonitorArrival. */
-    sig->totalSize.cx                           = VDD_WIDTH;
-    sig->totalSize.cy                           = VDD_HEIGHT;
-    sig->activeSize.cx                          = VDD_WIDTH;
-    sig->activeSize.cy                          = VDD_HEIGHT;
+    sig->totalSize.cx                           = width;
+    sig->totalSize.cy                           = height;
+    sig->activeSize.cx                          = width;
+    sig->activeSize.cy                          = height;
     sig->AdditionalSignalInfo.vSyncFreqDivider  = vSyncDivider;
     sig->AdditionalSignalInfo.videoStandard     = 255;
-    sig->vSyncFreq.Numerator                    = 60;
-    sig->vSyncFreq.Denominator                  = 1;
-    sig->hSyncFreq.Numerator                    = 60 * VDD_HEIGHT;
-    sig->hSyncFreq.Denominator                  = 1;
+    sig->vSyncFreq.Numerator                    = refreshNum;
+    sig->vSyncFreq.Denominator                  = refreshDenom;
+    sig->hSyncFreq.Numerator                    = refreshNum * height;
+    sig->hSyncFreq.Denominator                  = refreshDenom;
     sig->scanLineOrdering                       = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-    sig->pixelRate                               = (UINT64)60 * VDD_WIDTH * VDD_HEIGHT;
+    sig->pixelRate                              = ((UINT64)refreshNum * width * height) / refreshDenom;
 }
 
 /* ========================================================================= */
@@ -540,7 +540,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
        we have a valid frame in the staging texture for resend on idle. */
     BOOL bHasFrame = FALSE;
     BOOL bSentFullFrame = FALSE;   /* TRUE after first full frame sent to current client */
-    UINT cachedRowPitch = VDD_STRIDE;
+    UINT cachedRowPitch = 0;
 
 
     /* Main frame acquisition loop */
@@ -606,15 +606,16 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 if (SUCCEEDED(hr))
                 {
                     VDD_WIRE_FRAME_HEADER whdr;
-                    UINT32 data_size = VDD_STRIDE * VDD_HEIGHT;
+                    UINT stride = proc->stagingWidth * 4;
+                    UINT32 data_size = stride * proc->stagingHeight;
                     BOOL send_ok = TRUE;
                     SOCKET s = proc->hClientSocket;
 
                     proc->frameSeq++;
                     whdr.magic            = VDD_FRAME_MAGIC;
-                    whdr.width            = VDD_WIDTH;
-                    whdr.height           = VDD_HEIGHT;
-                    whdr.stride           = VDD_STRIDE;
+                    whdr.width            = proc->stagingWidth;
+                    whdr.height           = proc->stagingHeight;
+                    whdr.stride           = stride;
                     whdr.frame_seq        = proc->frameSeq;
                     whdr.dirty_rect_count = 0;
 
@@ -623,9 +624,9 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                         send_ok = FALSE;
                     }
                     if (send_ok) {
-                        for (UINT row = 0; row < VDD_HEIGHT; row++) {
+                        for (UINT row = 0; row < proc->stagingHeight; row++) {
                             if (VddSendAll(s, (const char*)((const BYTE*)mapped.pData + row * mapped.RowPitch),
-                                           VDD_STRIDE) != 0) {
+                                           stride) != 0) {
                                 send_ok = FALSE;
                                 break;
                             }
@@ -651,12 +652,34 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
             retryCount = 0;
 
             /* New frame from IddCx — capture and send to host if connected */
-            if (pSurface && proc->pStagingTex)
+            if (pSurface)
             {
                 ID3D11Texture2D* pTexture = nullptr;
                 hr = pSurface->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&pTexture);
                 if (SUCCEEDED(hr) && pTexture)
                 {
+                    D3D11_TEXTURE2D_DESC texDesc;
+                    pTexture->GetDesc(&texDesc);
+
+                    if (!proc->pStagingTex || proc->stagingWidth != texDesc.Width || proc->stagingHeight != texDesc.Height) {
+                        if (proc->pStagingTex) {
+                            proc->pStagingTex->Release();
+                            proc->pStagingTex = nullptr;
+                        }
+                        VddLog("Frame: resolution changed to %ux%u, recreating staging texture", texDesc.Width, texDesc.Height);
+                        hr = VddCreateStagingTexture(proc, texDesc.Width, texDesc.Height);
+                        if (FAILED(hr)) {
+                            VddLog("Frame: staging texture creation failed hr=0x%08X", hr);
+                            pTexture->Release();
+                            pSurface->Release();
+                            break; // force reassignment
+                        }
+                        proc->stagingWidth = texDesc.Width;
+                        proc->stagingHeight = texDesc.Height;
+                        bSentFullFrame = FALSE;
+                        bHasFrame = FALSE;
+                    }
+
                     proc->pDeviceContext->CopyResource(proc->pStagingTex, pTexture);
 
                     D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -692,19 +715,20 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                             }
 
                             VDD_WIRE_FRAME_HEADER whdr;
+                            UINT stride = proc->stagingWidth * 4;
                             BOOL send_ok = TRUE;
                             SOCKET s = proc->hClientSocket;
 
                             proc->frameSeq++;
                             whdr.magic            = VDD_FRAME_MAGIC;
-                            whdr.width            = VDD_WIDTH;
-                            whdr.height           = VDD_HEIGHT;
-                            whdr.stride           = VDD_STRIDE;
+                            whdr.width            = proc->stagingWidth;
+                            whdr.height           = proc->stagingHeight;
+                            whdr.stride           = stride;
                             whdr.frame_seq        = proc->frameSeq;
 
                             if (sendFull) {
                                 /* Full frame */
-                                UINT32 data_size = VDD_STRIDE * VDD_HEIGHT;
+                                UINT32 data_size = stride * proc->stagingHeight;
                                 whdr.dirty_rect_count = 0;
 
                                 if (VddSendAll(s, (const char*)&whdr, sizeof(whdr)) != 0 ||
@@ -712,9 +736,9 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                     send_ok = FALSE;
 
                                 if (send_ok) {
-                                    for (UINT row = 0; row < VDD_HEIGHT; row++) {
+                                    for (UINT row = 0; row < proc->stagingHeight; row++) {
                                         if (VddSendAll(s, (const char*)((const BYTE*)mapped.pData + row * mapped.RowPitch),
-                                                       VDD_STRIDE) != 0) {
+                                                       stride) != 0) {
                                             send_ok = FALSE;
                                             break;
                                         }
@@ -730,8 +754,8 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                 for (i = 0; i < rectCount; i++) {
                                     if (dirtyRects[i].left < 0) dirtyRects[i].left = 0;
                                     if (dirtyRects[i].top  < 0) dirtyRects[i].top  = 0;
-                                    if (dirtyRects[i].right  > (LONG)VDD_WIDTH)  dirtyRects[i].right  = VDD_WIDTH;
-                                    if (dirtyRects[i].bottom > (LONG)VDD_HEIGHT) dirtyRects[i].bottom = VDD_HEIGHT;
+                                    if (dirtyRects[i].right  > (LONG)proc->stagingWidth)  dirtyRects[i].right  = proc->stagingWidth;
+                                    if (dirtyRects[i].bottom > (LONG)proc->stagingHeight) dirtyRects[i].bottom = proc->stagingHeight;
                                     if (dirtyRects[i].left < dirtyRects[i].right &&
                                         dirtyRects[i].top < dirtyRects[i].bottom) {
                                         UINT rw = (UINT)(dirtyRects[i].right - dirtyRects[i].left);
@@ -779,7 +803,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                 bSentFullFrame = FALSE;
                             } else if (proc->frameSeq == 1) {
                                 VddLog("Frame: first frame sent (%ux%u, %u bytes)",
-                                       VDD_WIDTH, VDD_HEIGHT, VDD_STRIDE * VDD_HEIGHT);
+                                       proc->stagingWidth, proc->stagingHeight, stride * proc->stagingHeight);
                             }
                         skip_send:;
                         }
@@ -1180,19 +1204,8 @@ NTSTATUS VddMonitorAssignSwapChain(
     proc->bStopNetwork   = FALSE;
     proc->frameSeq       = 0;
 
-    /* Create staging texture for CPU readback */
-    VddLog("AssignSwapChain: creating staging texture (%ux%u)...", VDD_WIDTH, VDD_HEIGHT);
-    hr = VddCreateStagingTexture(proc, VDD_WIDTH, VDD_HEIGHT);
-    if (FAILED(hr))
-    {
-        VddLog("AssignSwapChain: staging texture creation FAILED hr=0x%08X", hr);
-        /* Don't release pDevice/pDeviceContext — they're cached in ctx */
-        if (proc->hTerminateEvent)
-            CloseHandle(proc->hTerminateEvent);
-        free(proc);
-        return (NTSTATUS)0xC01E0012L; /* STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN */
-    }
-    VddLog("AssignSwapChain: staging texture created");
+    /* Staging texture is deferred until the first frame is processed to match resolution */
+    VddLog("AssignSwapChain: deferring staging texture creation");
 
     /* Setup hardware cursor BEFORE starting swap chain thread — the thread
        reads proc->hCursorEvent at startup to build its wait handle array */
@@ -1304,21 +1317,31 @@ NTSTATUS VddParseMonitorDescription(
 {
     VddLog("ParseMonitorDescription: InputCount=%u", pInArgs->MonitorModeBufferInputCount);
 
-    pOutArgs->MonitorModeBufferOutputCount = 1;
+    pOutArgs->MonitorModeBufferOutputCount = g_NumResolutions * g_NumRefreshRates;
 
     if (pInArgs->MonitorModeBufferInputCount == 0)
         return STATUS_SUCCESS;
 
-    if (pInArgs->MonitorModeBufferInputCount < 1)
+    if (pInArgs->MonitorModeBufferInputCount < pOutArgs->MonitorModeBufferOutputCount)
         return STATUS_BUFFER_TOO_SMALL;
 
-    IDDCX_MONITOR_MODE* pMode = pInArgs->pMonitorModes;
-    pMode->Size = sizeof(IDDCX_MONITOR_MODE);
-    pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-    VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo, 0); /* vSyncDivider=0 for monitor modes */
+    for (UINT i = 0; i < g_NumResolutions; i++) {
+        for (UINT j = 0; j < g_NumRefreshRates; j++) {
+            UINT idx = i * g_NumRefreshRates + j;
+            IDDCX_MONITOR_MODE* pMode = &pInArgs->pMonitorModes[idx];
+            pMode->Size = sizeof(IDDCX_MONITOR_MODE);
+            pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
+            VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo, 
+                                 g_SupportedResolutions[i].width, 
+                                 g_SupportedResolutions[i].height, 
+                                 g_SupportedRefreshRates[j].numerator, 
+                                 g_SupportedRefreshRates[j].denominator, 
+                                 0); /* vSyncDivider=0 for monitor modes */
+        }
+    }
 
     pOutArgs->PreferredMonitorModeIdx = 0;
-    VddLog("ParseMonitorDescription: returning 1 mode (1920x1080@60)");
+    VddLog("ParseMonitorDescription: returning %u modes", pOutArgs->MonitorModeBufferOutputCount);
     return STATUS_SUCCESS;
 }
 
@@ -1336,21 +1359,31 @@ NTSTATUS VddMonitorGetDefaultModes(
 
     VddLog("GetDefaultModes: InputCount=%u", pInArgs->DefaultMonitorModeBufferInputCount);
 
-    pOutArgs->DefaultMonitorModeBufferOutputCount = 1;
+    pOutArgs->DefaultMonitorModeBufferOutputCount = g_NumResolutions * g_NumRefreshRates;
     pOutArgs->PreferredMonitorModeIdx = 0;
 
     if (pInArgs->DefaultMonitorModeBufferInputCount == 0)
         return STATUS_SUCCESS;
 
-    if (pInArgs->DefaultMonitorModeBufferInputCount < 1)
+    if (pInArgs->DefaultMonitorModeBufferInputCount < pOutArgs->DefaultMonitorModeBufferOutputCount)
         return STATUS_BUFFER_TOO_SMALL;
 
-    IDDCX_MONITOR_MODE* pMode = pInArgs->pDefaultMonitorModes;
-    pMode->Size = sizeof(IDDCX_MONITOR_MODE);
-    pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
-    VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo, 0); /* vSyncDivider=0 for monitor modes */
+    for (UINT i = 0; i < g_NumResolutions; i++) {
+        for (UINT j = 0; j < g_NumRefreshRates; j++) {
+            UINT idx = i * g_NumRefreshRates + j;
+            IDDCX_MONITOR_MODE* pMode = &pInArgs->pDefaultMonitorModes[idx];
+            pMode->Size = sizeof(IDDCX_MONITOR_MODE);
+            pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
+            VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo, 
+                                 g_SupportedResolutions[i].width, 
+                                 g_SupportedResolutions[i].height, 
+                                 g_SupportedRefreshRates[j].numerator, 
+                                 g_SupportedRefreshRates[j].denominator, 
+                                 0); /* vSyncDivider=0 for monitor modes */
+        }
+    }
 
-    VddLog("GetDefaultModes: returning 1 default mode");
+    VddLog("GetDefaultModes: returning %u default modes", pOutArgs->DefaultMonitorModeBufferOutputCount);
     return STATUS_SUCCESS;
 }
 
@@ -1368,19 +1401,29 @@ NTSTATUS VddMonitorQueryTargetModes(
 
     VddLog("QueryTargetModes: InputCount=%u", pInArgs->TargetModeBufferInputCount);
 
-    pOutArgs->TargetModeBufferOutputCount = 1;
+    pOutArgs->TargetModeBufferOutputCount = g_NumResolutions * g_NumRefreshRates;
 
     if (pInArgs->TargetModeBufferInputCount == 0)
         return STATUS_SUCCESS;
 
-    if (pInArgs->TargetModeBufferInputCount < 1)
+    if (pInArgs->TargetModeBufferInputCount < pOutArgs->TargetModeBufferOutputCount)
         return STATUS_BUFFER_TOO_SMALL;
 
-    IDDCX_TARGET_MODE* pMode = pInArgs->pTargetModes;
-    pMode->Size = sizeof(IDDCX_TARGET_MODE);
-    VddCreateMonitorMode(&pMode->TargetVideoSignalInfo.targetVideoSignalInfo, 1); /* vSyncDivider=1 for TARGET modes */
+    for (UINT i = 0; i < g_NumResolutions; i++) {
+        for (UINT j = 0; j < g_NumRefreshRates; j++) {
+            UINT idx = i * g_NumRefreshRates + j;
+            IDDCX_TARGET_MODE* pMode = &pInArgs->pTargetModes[idx];
+            pMode->Size = sizeof(IDDCX_TARGET_MODE);
+            VddCreateMonitorMode(&pMode->TargetVideoSignalInfo.targetVideoSignalInfo, 
+                                 g_SupportedResolutions[i].width, 
+                                 g_SupportedResolutions[i].height, 
+                                 g_SupportedRefreshRates[j].numerator, 
+                                 g_SupportedRefreshRates[j].denominator, 
+                                 1); /* vSyncDivider=1 for TARGET modes */
+        }
+    }
 
-    VddLog("QueryTargetModes: returning 1 target mode");
+    VddLog("QueryTargetModes: returning %u target modes", pOutArgs->TargetModeBufferOutputCount);
     return STATUS_SUCCESS;
 }
 
@@ -1433,22 +1476,32 @@ NTSTATUS VddParseMonitorDescription2(
 {
     VddLog("ParseMonitorDescription2: InputCount=%u", pInArgs->MonitorModeBufferInputCount);
 
-    pOutArgs->MonitorModeBufferOutputCount = 1;
+    pOutArgs->MonitorModeBufferOutputCount = g_NumResolutions * g_NumRefreshRates;
 
     if (pInArgs->MonitorModeBufferInputCount == 0)
         return STATUS_SUCCESS;
 
-    if (pInArgs->MonitorModeBufferInputCount < 1)
+    if (pInArgs->MonitorModeBufferInputCount < pOutArgs->MonitorModeBufferOutputCount)
         return STATUS_BUFFER_TOO_SMALL;
 
-    IDDCX_MONITOR_MODE2* pMode = pInArgs->pMonitorModes;
-    pMode->Size = sizeof(IDDCX_MONITOR_MODE2);
-    pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-    VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo, 0);
-    pMode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
+    for (UINT i = 0; i < g_NumResolutions; i++) {
+        for (UINT j = 0; j < g_NumRefreshRates; j++) {
+            UINT idx = i * g_NumRefreshRates + j;
+            IDDCX_MONITOR_MODE2* pMode = &pInArgs->pMonitorModes[idx];
+            pMode->Size = sizeof(IDDCX_MONITOR_MODE2);
+            pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
+            VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo, 
+                                 g_SupportedResolutions[i].width, 
+                                 g_SupportedResolutions[i].height, 
+                                 g_SupportedRefreshRates[j].numerator, 
+                                 g_SupportedRefreshRates[j].denominator, 
+                                 0);
+            pMode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
+        }
+    }
 
     pOutArgs->PreferredMonitorModeIdx = 0;
-    VddLog("ParseMonitorDescription2: returning 1 mode (8bpc)");
+    VddLog("ParseMonitorDescription2: returning %u modes (8bpc)", pOutArgs->MonitorModeBufferOutputCount);
     return STATUS_SUCCESS;
 }
 
@@ -1466,17 +1519,30 @@ NTSTATUS VddMonitorQueryTargetModes2(
 
     VddLog("QueryTargetModes2: InputCount=%u", pInArgs->TargetModeBufferInputCount);
 
-    pOutArgs->TargetModeBufferOutputCount = 1;
+    pOutArgs->TargetModeBufferOutputCount = g_NumResolutions * g_NumRefreshRates;
 
-    if (pInArgs->TargetModeBufferInputCount >= 1)
-    {
-        IDDCX_TARGET_MODE2* pMode = pInArgs->pTargetModes;
-        pMode->Size = sizeof(IDDCX_TARGET_MODE2);
-        pMode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
-        VddCreateMonitorMode(&pMode->TargetVideoSignalInfo.targetVideoSignalInfo, 1);
+    if (pInArgs->TargetModeBufferInputCount == 0)
+        return STATUS_SUCCESS;
+
+    if (pInArgs->TargetModeBufferInputCount < pOutArgs->TargetModeBufferOutputCount)
+        return STATUS_BUFFER_TOO_SMALL;
+
+    for (UINT i = 0; i < g_NumResolutions; i++) {
+        for (UINT j = 0; j < g_NumRefreshRates; j++) {
+            UINT idx = i * g_NumRefreshRates + j;
+            IDDCX_TARGET_MODE2* pMode = &pInArgs->pTargetModes[idx];
+            pMode->Size = sizeof(IDDCX_TARGET_MODE2);
+            pMode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
+            VddCreateMonitorMode(&pMode->TargetVideoSignalInfo.targetVideoSignalInfo, 
+                                 g_SupportedResolutions[i].width, 
+                                 g_SupportedResolutions[i].height, 
+                                 g_SupportedRefreshRates[j].numerator, 
+                                 g_SupportedRefreshRates[j].denominator, 
+                                 1);
+        }
     }
 
-    VddLog("QueryTargetModes2: returning 1 target mode (8bpc)");
+    VddLog("QueryTargetModes2: returning %u target modes (8bpc)", pOutArgs->TargetModeBufferOutputCount);
     return STATUS_SUCCESS;
 }
 

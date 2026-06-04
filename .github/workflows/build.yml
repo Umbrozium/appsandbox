@@ -1,0 +1,67 @@
+name: Build C++ MSBuild Project
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        configuration: [Release, Debug]
+        platform: [x64, ARM64]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Restore NuGet packages
+      run: nuget restore AppSandbox.sln
+
+    - name: Build the solution
+      run: msbuild AppSandbox.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=${{ matrix.platform }} /m
+
+    - name: Package Release Structure
+      run: |
+        $binDir = "bin\${{ matrix.platform }}\${{ matrix.configuration }}"
+        if (-not (Test-Path $binDir)) { 
+            # Fallback if MsBuild outputs to bin\Release instead of bin\x64\Release
+            $binDir = "bin\${{ matrix.configuration }}" 
+        }
+        
+        $stage = "stage"
+        New-Item -ItemType Directory -Force -Path $stage | Out-Null
+        
+        # Root binaries
+        $rootBins = @('AppSandbox.exe', 'appsandbox_core.dll', 'iso-patch.exe', 'WebView2Loader.dll')
+        foreach ($b in $rootBins) {
+            if (Test-Path "$binDir\$b") {
+                Copy-Item "$binDir\$b" "$stage\$b" -Force
+            }
+        }
+        
+        # Subdirectories
+        foreach ($sub in @('resources', 'drivers', 'web')) {
+            if (Test-Path "$binDir\$sub") {
+                robocopy "$binDir\$sub" "$stage\$sub" /E /XF *.pdb *.lib *.exp *.ilk *.iobj *.ipdb *.log *.cer | Out-Null
+                if ($LASTEXITCODE -ge 8) { throw "robocopy $sub failed (exit $LASTEXITCODE)." }
+                $global:LASTEXITCODE = 0
+            }
+        }
+        
+        Compress-Archive -Path "$stage\*" -DestinationPath "AppSandbox-${{ matrix.platform }}-${{ matrix.configuration }}.zip"
+      shell: powershell
+
+    - name: Upload Release Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: AppSandbox-${{ matrix.platform }}-${{ matrix.configuration }}
+        path: AppSandbox-${{ matrix.platform }}-${{ matrix.configuration }}.zip
+

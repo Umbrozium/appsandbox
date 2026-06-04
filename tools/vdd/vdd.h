@@ -37,11 +37,6 @@ Environment:
 /* ============================================================================
  *  Display constants
  * ============================================================================ */
-#define VDD_WIDTH            1920
-#define VDD_HEIGHT           1080
-#define VDD_BPP              4          /* BGRA 8-bit */
-#define VDD_STRIDE           (VDD_WIDTH * VDD_BPP)
-#define VDD_PIXEL_BYTES      (VDD_STRIDE * VDD_HEIGHT)
 #define VDD_MAX_DIRTY_RECTS  64
 
 /* ============================================================================
@@ -90,7 +85,9 @@ struct ResolutionEntry {
 };
 
 static const ResolutionEntry g_SupportedResolutions[] = {
+    { 1280, 720 },
     { 1920, 1080 },
+    { 1280, 1024 },
 };
 
 static const UINT g_NumResolutions = ARRAYSIZE(g_SupportedResolutions);
@@ -102,6 +99,8 @@ struct RefreshRateEntry {
 
 static const RefreshRateEntry g_SupportedRefreshRates[] = {
     { 60, 1 },
+    { 120, 1 },
+    { 180, 1 },
 };
 
 static const UINT g_NumRefreshRates = ARRAYSIZE(g_SupportedRefreshRates);
@@ -192,6 +191,8 @@ typedef struct _VDD_SWAP_PROC {
 
     /* Staging texture for CPU readback (owned, per-swap-chain) */
     ID3D11Texture2D*    pStagingTex;
+    UINT                stagingWidth;
+    UINT                stagingHeight;
 
     /* Direct HvSocket connection to host (replaces shared memory) */
     HANDLE              hNetworkThread;     /* listener/accept thread */
